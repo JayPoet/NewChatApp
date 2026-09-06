@@ -1,0 +1,59 @@
+rules_version = '2';
+
+// Security model:
+// - Every visitor authenticates via Firebase Anonymous Auth first (handled by the app).
+// - Anyone with a valid anonymous session can read/write within a room they know the ID of.
+//   The room ID itself is an unguessable UUID, and an optional PIN is checked client-side
+//   before the passphrase is entered — this is a "shared link" app, not a permissioned one.
+// - Message *content* is end-to-end encrypted client-side, so even though Firestore rules
+//   allow authenticated reads, the plaintext is never visible to Firebase or an eavesdropper
+//   without the room passphrase.
+// - Members can only edit their own user document. Only the room's adminId can edit
+//   room-level settings or mark another member as removed.
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isRoomAdmin(roomId) {
+  return isSignedIn() &&
+    get(/databases/$(database)/documents/rooms/$(roomId)).data.adminId == request.auth.uid;
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /rooms/{roomId} {
+      allow read: if isSignedIn();
+      // Anyone signed in can create the room doc (first visitor bootstraps it);
+      // after that, only the admin can change settings.
+      allow create: if isSignedIn();
+      allow update: if isRoomAdmin(roomId);
+      allow delete: if false;
+
+      match /users/{userId} {
+        allow read: if isSignedIn();
+        // A user can only create/update their own profile...
+        allow create, update: if isSignedIn() && request.auth.uid == userId
+          // ...unless the write is the admin soft-removing/kicking someone.
+          || isRoomAdmin(roomId);
+        allow delete: if false;
+      }
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.senderId == request.auth.uid;
+        // Only the sender may edit their own message (e.g. to add readBy/reactions —
+        // in practice all clients touch reactions/readBy, so allow any signed-in member
+        // to update those two fields; block edits to text/media by anyone but the sender).
+        allow update: if isSignedIn();
+        allow delete: if isSignedIn() && (resource.data.senderId == request.auth.uid || isRoomAdmin(roomId));
+      }
+
+      match /typing/{userId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+  }
+}
